@@ -106,10 +106,11 @@ python train_crossattn_gen.py --config configs/config_crossattn_generated.yaml -
 If you find this work useful, please cite our paper:
 
 ```bibtex
-@article{wang2025improving,
+@inproceedings{wang2025improving,
   title={On Improving PPG-Based Sleep Staging: A Pilot Study},
   author={Wang, Jiawei and Guan, Yu and Chen, Chen and Zhou, Ligang and Yang, Laurence T and Gu, Sai},
-  journal={arXiv preprint arXiv:2508.02689},
+  booktitle={Companion of the 2025 ACM International Joint Conference on Pervasive and Ubiquitous Computing},
+  pages={1640--1644},
   year={2025}
 }
 ```
