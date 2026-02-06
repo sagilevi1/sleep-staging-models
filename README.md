@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Official implementation of "On Improving PPG-Based Sleep Staging: A Pilot Study" - exploring dual-stream cross-attention architectures for enhanced sleep stage classification using PPG signals.
->  This work has been accepted as a workshop paper to the *Companion of the 2025 ACM International Joint Conference on Pervasive and Ubiquitous Computing (UbiComp/ISWC 2025)*.
+>  This work has been published as a workshop paper to the *Companion of the 2025 ACM International Joint Conference on Pervasive and Ubiquitous Computing (UbiComp/ISWC 2025)*.
 
 ## 📋 Abstract
 
