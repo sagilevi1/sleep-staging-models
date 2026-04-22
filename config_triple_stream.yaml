@@ -16,7 +16,7 @@ data:
   test_ratio: 0.15            # Test split ratio
   seed: 42                    # Random seed
   min_windows_per_subject: 10 # Minimum windows to include subject
-  num_workers: 4              # DataLoader workers
+  num_workers: 0              # DataLoader workers
 
 # Model configuration
 model:
@@ -29,7 +29,7 @@ model:
 
 # Training configuration
 training:
-  batch_size: 16
+  batch_size: 8
   num_epochs: 1
   patience: 15                # Early stopping patience
   
