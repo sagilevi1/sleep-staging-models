@@ -29,7 +29,7 @@ model:
 
 # Training configuration
 training:
-  batch_size: 8
+  batch_size: 2
   num_epochs: 1
   patience: 15                # Early stopping patience
   
@@ -74,6 +74,6 @@ output:
 # Hardware configuration
 hardware:
   use_amp: true               # Mixed precision training
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   device: "cuda"              # cuda or cpu
 
