@@ -1,0 +1,79 @@
+# =============================================================================
+# DREAMT Triple-Stream Sleep Staging Configuration
+# =============================================================================
+# Dataset: DREAMT 64Hz wearable data
+# Modalities: PPG (BVP), ACC (3-channel), IBI (HRV features)
+# Classes: 6 (P, W, N1, N2, N3, REM)
+# =============================================================================
+
+# Data configuration
+data:
+  data_dir: '/content/drive/MyDrive/DREAMT/data_64Hz'
+  fs: 64.0                    # Sampling frequency (Hz)
+  window_sec: 30.0            # Window duration (seconds)
+  train_ratio: 0.70           # Train split ratio
+  val_ratio: 0.15             # Validation split ratio
+  test_ratio: 0.15            # Test split ratio
+  seed: 42                    # Random seed
+  min_windows_per_subject: 10 # Minimum windows to include subject
+  num_workers: 4              # DataLoader workers
+
+# Model configuration
+model:
+  n_classes: 6                # P, W, N1, N2, N3, REM
+  d_model: 256                # Model dimension
+  n_heads: 8                  # Number of attention heads
+  n_fusion_blocks: 3          # Number of fusion stages
+  dropout: 0.2                # Dropout rate
+  ibi_n_features: 5           # Number of IBI/HRV features
+
+# Training configuration
+training:
+  batch_size: 16
+  num_epochs: 1
+  patience: 15                # Early stopping patience
+  
+  # Learning rates
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  
+  # Staged training (optional - for fine-tuning with pretrained PPG)
+  staged_training: false      # Set to true to enable staged training
+  
+  stage1:
+    epochs: 10
+    ppg_encoder_lr: 0         # Frozen
+    acc_encoder_lr: 1.0e-4
+    ibi_encoder_lr: 1.0e-4
+    fusion_lr: 1.0e-4
+    temporal_lr: 1.0e-4
+    classifier_lr: 1.0e-4
+  
+  stage2:
+    epochs: 15
+    ppg_encoder_lr: 1.0e-5    # Unfreeze with low LR
+    acc_encoder_lr: 5.0e-5
+    ibi_encoder_lr: 5.0e-5
+    fusion_lr: 5.0e-5
+    temporal_lr: 5.0e-5
+    classifier_lr: 5.0e-5
+  
+  stage3:
+    epochs: 25
+    global_lr: 1.0e-5
+
+  # Modality dropout (regularization)
+  modality_dropout_prob: 0.0  # Set > 0 to enable (e.g., 0.1)
+
+# Output configuration
+output:
+  save_dir: "./outputs/triple_stream"
+  save_frequency: 5           # Save checkpoint every N epochs
+  log_frequency: 10           # Log every N batches
+
+# Hardware configuration
+hardware:
+  use_amp: true               # Mixed precision training
+  gradient_accumulation_steps: 1
+  device: "cuda"              # cuda or cpu
+
