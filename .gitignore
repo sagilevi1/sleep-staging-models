@@ -1,0 +1,6 @@
+.venv/
+.cursor/
+.claude/
+__pycache__/
+outputs/
+*.pyc
