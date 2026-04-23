@@ -510,7 +510,7 @@ class MultiModalTrainer:
         print("=" * 60)
 
         # 加载最佳模型
-        checkpoint = torch.load(best_model_path)
+        checkpoint = torch.load(best_model_path, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
 
         # 测试

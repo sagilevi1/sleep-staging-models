@@ -488,7 +488,7 @@ class CrossAttentionTrainer:
         print("=" * 60)
 
         # Load best model
-        checkpoint = torch.load(os.path.join(self.checkpoint_dir, 'best_model.pth'))
+        checkpoint = torch.load(os.path.join(self.checkpoint_dir, 'best_model.pth'), weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
 
         # Test

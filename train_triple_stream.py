@@ -534,7 +534,9 @@ class TripleStreamTrainer:
         # Load best model (fall back to current weights if never saved)
         best_model_path = self.checkpoint_dir / "best_model.pth"
         if best_model_path.exists():
-            checkpoint = torch.load(best_model_path, map_location=self.device)
+            # weights_only=False: checkpoint includes optimizer state + config dict,
+            # not just a state_dict. PyTorch 2.6 flipped the default to True.
+            checkpoint = torch.load(best_model_path, map_location=self.device, weights_only=False)
             model.load_state_dict(checkpoint["model_state_dict"])
             logger.info(f"Loaded best model from epoch {checkpoint['epoch']}")
         else:
