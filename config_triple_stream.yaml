@@ -8,7 +8,20 @@
 
 # Data configuration
 data:
-  data_dir: '/content/drive/MyDrive/DREAMT/data_64Hz'
+  # ── Numpy backend (fast, Colab-safe) ─────────────────────────────────────
+  # Set this to the folder produced by preprocess_dreamt.py.
+  # When set, the CSV backend below is ignored entirely.
+  #
+  # Local:  ./dreamt_processed
+  # Colab:  /content/drive/MyDrive/DREAMT/processed
+  #         (or /content/dreamt_processed if you copied from Drive to local disk)
+  preprocessed_dir: "./dreamt_processed"   # Set to "" to use CSV backend
+
+  # ── CSV backend (original, slow, high-RAM) ────────────────────────────────
+  # Only used when preprocessed_dir is empty.
+  data_dir: 'C:\Users\SagiLevi\dreamt\dreamt-dataset-for-real-time-sleep-stage-estimation-using-multisensor-wearable-technology-2.1.0\dreamt-dataset-for-real-time-sleep-stage-estimation-using-multisensor-wearable-technology-2.1.0\data_64Hz'
+
+  # ── Shared settings ───────────────────────────────────────────────────────
   fs: 64.0                    # Sampling frequency (Hz)
   window_sec: 30.0            # Window duration (seconds)
   train_ratio: 0.70           # Train split ratio
@@ -16,7 +29,7 @@ data:
   test_ratio: 0.15            # Test split ratio
   seed: 42                    # Random seed
   min_windows_per_subject: 10 # Minimum windows to include subject
-  num_workers: 0              # DataLoader workers
+  num_workers: 0              # DataLoader workers (0 = safest; increase on Linux/Colab GPU)
 
 # Model configuration
 model:
@@ -29,8 +42,8 @@ model:
 
 # Training configuration
 training:
-  batch_size: 2
-  num_epochs: 1
+  batch_size: 32
+  num_epochs: 1               # Set to 50 for full training
   patience: 15                # Early stopping patience
   
   # Learning rates
@@ -68,12 +81,12 @@ training:
 # Output configuration
 output:
   save_dir: "./outputs/triple_stream"
-  save_frequency: 5           # Save checkpoint every N epochs
+  save_frequency: 1           # Save checkpoint every N epochs
   log_frequency: 10           # Log every N batches
 
 # Hardware configuration
 hardware:
   use_amp: true               # Mixed precision training
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
   device: "cuda"              # cuda or cpu
 

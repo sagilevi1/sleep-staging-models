@@ -51,11 +51,14 @@ except ImportError:
     SummaryWriter = None
 
 from dreamt_triple_dataset import (
-    DatasetConfig,
-    DreamtTripleStreamDataset,
-    get_dataloaders,
+    DatasetConfig as _CsvDatasetConfig,
+    get_dataloaders as _get_csv_dataloaders,
     STAGE_NAMES,
     NUM_CLASSES,
+)
+from dreamt_numpy_dataset import (
+    DatasetConfig,
+    get_dataloaders as _get_numpy_dataloaders,
 )
 from triple_stream_model import TripleStreamSleepNet, create_triple_stream_model
 
@@ -134,31 +137,60 @@ class TripleStreamTrainer:
         logger.info(f"Output directory: {self.output_dir}")
     
     def _create_dataloaders(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
-        """Create train, validation, and test dataloaders."""
-        data_config = self.config.get("data", {})
-        
-        dataset_config = DatasetConfig(
-            data_dir=data_config.get("data_dir", "C:/Users/SagiLevi/data_64Hz"),
-            fs=data_config.get("fs", 64.0),
-            window_sec=data_config.get("window_sec", 30.0),
-            train_ratio=data_config.get("train_ratio", 0.70),
-            val_ratio=data_config.get("val_ratio", 0.15),
-            test_ratio=data_config.get("test_ratio", 0.15),
-            seed=data_config.get("seed", 42),
-            min_windows_per_subject=data_config.get("min_windows_per_subject", 10),
-        )
-        
-        train_loader, val_loader, test_loader, train_ds, val_ds, test_ds = get_dataloaders(
-            dataset_config,
-            batch_size=self.config.get("training", {}).get("batch_size", 16),
-            num_workers=data_config.get("num_workers", 4),
-            pin_memory=True,
-        )
-        
-        # Store class weights for loss function
+        """Create train, validation, and test dataloaders.
+
+        Auto-selects backend:
+          - If data.preprocessed_dir is set → DreamtNumpyDataset (fast, Colab-safe)
+          - Otherwise                        → DreamtTripleStreamDataset (CSV-based)
+        """
+        data_config   = self.config.get("data", {})
+        batch_size    = self.config.get("training", {}).get("batch_size", 32)
+        num_workers   = data_config.get("num_workers", 0)
+        pin_memory    = self.device.type == "cuda"
+
+        preprocessed_dir = data_config.get("preprocessed_dir", "").strip()
+
+        if preprocessed_dir:
+            # ── Fast numpy backend ────────────────────────────────────────
+            logger.info(f"Using numpy backend: {preprocessed_dir}")
+            dataset_config = DatasetConfig(
+                preprocessed_dir=preprocessed_dir,
+                fs=data_config.get("fs", 64.0),
+                window_sec=data_config.get("window_sec", 30.0),
+                train_ratio=data_config.get("train_ratio", 0.70),
+                val_ratio=data_config.get("val_ratio", 0.15),
+                seed=data_config.get("seed", 42),
+            )
+            train_loader, val_loader, test_loader, train_ds, val_ds, test_ds = \
+                _get_numpy_dataloaders(
+                    dataset_config,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                )
+        else:
+            # ── CSV fallback backend ──────────────────────────────────────
+            logger.info("Using CSV backend (set data.preprocessed_dir to switch to numpy)")
+            csv_config = _CsvDatasetConfig(
+                data_dir=data_config.get("data_dir", ""),
+                fs=data_config.get("fs", 64.0),
+                window_sec=data_config.get("window_sec", 30.0),
+                train_ratio=data_config.get("train_ratio", 0.70),
+                val_ratio=data_config.get("val_ratio", 0.15),
+                test_ratio=data_config.get("test_ratio", 0.15),
+                seed=data_config.get("seed", 42),
+                min_windows_per_subject=data_config.get("min_windows_per_subject", 10),
+            )
+            train_loader, val_loader, test_loader, train_ds, val_ds, test_ds = \
+                _get_csv_dataloaders(
+                    csv_config,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                )
+
         self.class_weights = train_ds.get_class_weights().to(self.device)
         logger.info(f"Class weights: {self.class_weights.tolist()}")
-        
         return train_loader, val_loader, test_loader
     
     def _create_model(self) -> TripleStreamSleepNet:
@@ -499,9 +531,14 @@ class TripleStreamTrainer:
         logger.info("Evaluating best model on test set")
         logger.info("=" * 70)
         
-        # Load best model
-        checkpoint = torch.load(self.checkpoint_dir / "best_model.pth")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # Load best model (fall back to current weights if never saved)
+        best_model_path = self.checkpoint_dir / "best_model.pth"
+        if best_model_path.exists():
+            checkpoint = torch.load(best_model_path, map_location=self.device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            logger.info(f"Loaded best model from epoch {checkpoint['epoch']}")
+        else:
+            logger.warning("No best_model.pth found — evaluating current model weights")
         
         # Test
         test_metrics = self._validate(model, test_loader, criterion)

@@ -115,49 +115,42 @@ def map_stage_to_id(stage_value) -> int:
 
 def compute_ibi_features(ibi_values: np.ndarray) -> np.ndarray:
     """
-    Compute HRV feature vector from IBI values within a window.
-    
-    Features (5 total):
-    - mean_ibi: Mean inter-beat interval (ms)
-    - std_ibi: Standard deviation of IBI
-    - rmssd: Root mean square of successive differences
-    - hr_mean: Mean heart rate (60000 / mean_ibi)
-    - n_beats: Number of valid IBI values
-    
+    Compute HRV feature vector from a 64Hz IBI window.
+
+    In DREAMT, the IBI column is sampled at 64Hz: each inter-beat interval
+    is repeated for every sample until the next heartbeat. We deduplicate
+    consecutive identical values to recover the actual beat-to-beat sequence.
+
+    Features (5):
+        mean_ibi  — mean inter-beat interval (seconds)
+        std_ibi   — std of IBI (HRV measure)
+        rmssd     — root-mean-square of successive differences
+        hr_mean   — mean heart rate in BPM (60 / mean_ibi)
+        n_beats   — number of heartbeats detected in the window
+
     Args:
-        ibi_values: Array of IBI values (may contain NaN)
-    
+        ibi_values: (window_samples,) array, may contain NaN
+
     Returns:
         Feature vector of shape (5,)
     """
-    # Remove NaN values
     ibi_clean = ibi_values[~np.isnan(ibi_values)]
-    
     if len(ibi_clean) < 2:
-        # Not enough data - return zeros
         return np.zeros(5, dtype=np.float32)
-    
-    mean_ibi = np.mean(ibi_clean)
-    std_ibi = np.std(ibi_clean)
-    
-    # RMSSD: Root mean square of successive differences
-    if len(ibi_clean) > 1:
-        successive_diff = np.diff(ibi_clean)
-        rmssd = np.sqrt(np.mean(successive_diff ** 2))
-    else:
-        rmssd = 0.0
-    
-    # Heart rate (assuming IBI is in milliseconds)
-    # If IBI appears to be in seconds (< 10), convert
-    if mean_ibi < 10:
-        # IBI is likely in seconds, convert to ms for HR calculation
-        hr_mean = 60.0 / mean_ibi if mean_ibi > 0 else 0.0
-    else:
-        # IBI is in milliseconds
-        hr_mean = 60000.0 / mean_ibi if mean_ibi > 0 else 0.0
-    
-    n_beats = float(len(ibi_clean))
-    
+
+    # Deduplicate consecutive identical values → actual beat sequence
+    change_mask = np.concatenate([[True], np.diff(ibi_clean) != 0])
+    ibi_beats   = ibi_clean[change_mask]
+
+    if len(ibi_beats) < 2:
+        return np.zeros(5, dtype=np.float32)
+
+    mean_ibi = float(np.mean(ibi_beats))
+    std_ibi  = float(np.std(ibi_beats))
+    rmssd    = float(np.sqrt(np.mean(np.diff(ibi_beats) ** 2)))
+    hr_mean  = (60.0 / mean_ibi) if mean_ibi > 0 else 0.0
+    n_beats  = float(len(ibi_beats))
+
     return np.array([mean_ibi, std_ibi, rmssd, hr_mean, n_beats], dtype=np.float32)
 
 
