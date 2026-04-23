@@ -43,7 +43,7 @@ model:
 # Training configuration
 training:
   batch_size: 32
-  num_epochs: 1               # Set to 50 for full training
+  num_epochs: 50               # Set to 50 for full training
   patience: 15                # Early stopping patience
   
   # Learning rates
