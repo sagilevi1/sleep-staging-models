@@ -4,3 +4,10 @@
 __pycache__/
 outputs/
 *.pyc
+
+# Large preprocessed arrays (3+ GB) — regenerated locally via preprocess_dreamt.py
+dreamt_processed/
+*.npy
+
+# Local PDFs / papers
+*.pdf
