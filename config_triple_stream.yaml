@@ -80,7 +80,7 @@ training:
 
 # Output configuration
 output:
-  save_dir: "./outputs/triple_stream"
+  save_dir: "/content/drive/MyDrive/DREAMT/outputs/triple_stream"
   save_frequency: 1           # Save checkpoint every N epochs
   log_frequency: 10           # Log every N batches
 
