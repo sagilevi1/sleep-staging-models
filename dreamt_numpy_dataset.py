@@ -28,6 +28,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+from augmentations import AugmentationConfig, apply_window_augmentations
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,10 +82,16 @@ class DreamtNumpyDataset(Dataset):
         split: str = "train",
         normalize: bool = True,
         verbose: bool = True,
+        augment_config: Optional[AugmentationConfig] = None,
     ):
         self.split     = split
         self.normalize = normalize
         self.verbose   = verbose
+        # Augmentations are only meaningful for training; trainer should pass
+        # AugmentationConfig() (disabled) for val/test.
+        self.augment_config = augment_config or AugmentationConfig()
+        # Per-worker RNG (re-seeded from torch worker_init if multi-worker)
+        self._rng = np.random.default_rng()
 
         base = Path(preprocessed_dir)
         self._validate_dir(base)
@@ -153,6 +161,12 @@ class DreamtNumpyDataset(Dataset):
             # Global z-score for IBI (train-split statistics)
             ibi = (ibi - self.ibi_mean) / self.ibi_std
 
+        # Augmentations (only active for train if configured)
+        if self.augment_config.is_active():
+            bvp, acc, ibi = apply_window_augmentations(
+                bvp, acc, ibi, self.augment_config, rng=self._rng
+            )
+
         # Add channel dim to BVP:  (1920,) → (1, 1920)
         bvp = bvp[np.newaxis, :]
 
@@ -207,6 +221,7 @@ def get_dataloaders(
     batch_size: int = 32,
     num_workers: int = 0,
     pin_memory: bool = False,
+    augment_config: Optional[AugmentationConfig] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader,
            DreamtNumpyDataset, DreamtNumpyDataset, DreamtNumpyDataset]:
     """
@@ -236,9 +251,13 @@ def get_dataloaders(
     logger.info(f"Preprocessed dir: {preprocessed_dir}")
     logger.info("=" * 60)
 
-    train_ds = DreamtNumpyDataset(preprocessed_dir, split="train")
+    train_ds = DreamtNumpyDataset(
+        preprocessed_dir, split="train", augment_config=augment_config,
+    )
     val_ds   = DreamtNumpyDataset(preprocessed_dir, split="val")
     test_ds  = DreamtNumpyDataset(preprocessed_dir, split="test")
+    if augment_config is not None and augment_config.is_active():
+        logger.info(f"[AUG] Train augmentations enabled: {augment_config}")
 
     # Verify no subject overlap (subjects are stored per-window in subjects.npy)
     train_subjects = set(train_ds.get_subjects())

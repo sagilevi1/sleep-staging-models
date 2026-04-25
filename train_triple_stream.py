@@ -61,6 +61,9 @@ from dreamt_numpy_dataset import (
     get_dataloaders as _get_numpy_dataloaders,
 )
 from triple_stream_model import TripleStreamSleepNet, create_triple_stream_model
+from augmentations import AugmentationConfig
+from losses import build_loss
+from experiment_tracker import ExperimentTracker
 
 # Configure logging
 logging.basicConfig(
@@ -78,16 +81,23 @@ logger = logging.getLogger(__name__)
 class TripleStreamTrainer:
     """Trainer for Triple-Stream Sleep Staging Model."""
     
-    def __init__(self, config: dict, run_id: Optional[int] = None):
+    def __init__(
+        self,
+        config: dict,
+        run_id: Optional[int] = None,
+        tracker: Optional[ExperimentTracker] = None,
+    ):
         """
         Initialize trainer.
-        
+
         Args:
             config: Configuration dictionary
             run_id: Optional run ID for multiple runs
+            tracker: Optional ExperimentTracker for reproducibility logging
         """
         self.config = config
         self.run_id = run_id
+        self.tracker = tracker
         
         # Setup device
         device_name = config.get("hardware", {}).get("device", "cuda")
@@ -161,12 +171,14 @@ class TripleStreamTrainer:
                 val_ratio=data_config.get("val_ratio", 0.15),
                 seed=data_config.get("seed", 42),
             )
+            aug_cfg = AugmentationConfig.from_config(self.config.get("training", {}))
             train_loader, val_loader, test_loader, train_ds, val_ds, test_ds = \
                 _get_numpy_dataloaders(
                     dataset_config,
                     batch_size=batch_size,
                     num_workers=num_workers,
                     pin_memory=pin_memory,
+                    augment_config=aug_cfg,
                 )
         else:
             # ── CSV fallback backend ──────────────────────────────────────
@@ -191,6 +203,21 @@ class TripleStreamTrainer:
 
         self.class_weights = train_ds.get_class_weights().to(self.device)
         logger.info(f"Class weights: {self.class_weights.tolist()}")
+        if self.tracker is not None:
+            try:
+                self.tracker.log_dataset_info(train_ds, val_ds, test_ds)
+                self.tracker.log_preprocessing_info({
+                    "bvp_filter": "none",
+                    "bvp_norm": "per-window-zscore",
+                    "acc_norm": "per-window-per-channel-zscore",
+                    "ibi_norm": "global-zscore-train-stats",
+                    "modalities": ["bvp", "acc", "ibi"],
+                    "ibi_n_features": self.config.get("model", {}).get("ibi_n_features", 5),
+                    "window_samples": int(self.config.get("data", {}).get("fs", 64.0)
+                                          * self.config.get("data", {}).get("window_sec", 30.0)),
+                })
+            except Exception as e:
+                logger.warning(f"Tracker.log_dataset_info failed: {e}")
         return train_loader, val_loader, test_loader
     
     def _create_model(self) -> TripleStreamSleepNet:
@@ -431,21 +458,34 @@ class TripleStreamTrainer:
         
         # Create model
         model = self._create_model()
-        
-        # Loss function with class weights
-        criterion = nn.CrossEntropyLoss(weight=self.class_weights)
-        
-        # Optimizer
+        if self.tracker is not None:
+            try:
+                self.tracker.log_model(model)
+            except Exception as e:
+                logger.warning(f"Tracker.log_model failed: {e}")
+
+        # Loss function (Focal by default; switchable to CE via config)
         training_config = self.config.get("training", {})
+        criterion = build_loss(
+            loss_type=training_config.get("loss", "focal"),
+            class_weights=self.class_weights,
+            gamma=training_config.get("focal_gamma", 2.0),
+            label_smoothing=training_config.get("label_smoothing", 0.0),
+        )
+
+        # Optimizer
         optimizer = optim.AdamW(
             model.parameters(),
             lr=training_config.get("learning_rate", 1e-4),
             weight_decay=training_config.get("weight_decay", 1e-5),
         )
-        
-        # Learning rate scheduler
+
+        # Learning rate scheduler (config-driven patience/factor)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=5
+            optimizer,
+            mode="max",
+            factor=training_config.get("scheduler_factor", 0.5),
+            patience=training_config.get("scheduler_patience", 3),
         )
         
         # Training loop
@@ -497,6 +537,19 @@ class TripleStreamTrainer:
             history["val_acc"].append(val_metrics["accuracy"])
             history["val_kappa"].append(val_metrics["kappa"])
             history["val_f1"].append(val_metrics["f1_weighted"])
+
+            # Experiment tracker: per-epoch metrics
+            if self.tracker is not None:
+                try:
+                    self.tracker.log_epoch(
+                        epoch=epoch,
+                        train_loss=train_loss,
+                        train_acc=train_acc,
+                        val_metrics=val_metrics,
+                        lr=optimizer.param_groups[0]["lr"],
+                    )
+                except Exception as e:
+                    logger.warning(f"Tracker.log_epoch failed: {e}")
             
             # Check for improvement
             if val_metrics["kappa"] > best_kappa:
@@ -589,13 +642,24 @@ class TripleStreamTrainer:
             json.dump(results, f, indent=2)
         
         logger.info(f"\nResults saved to: {results_path}")
-        
+
         # Plot training curves
         self._plot_training_curves(history)
-        
+
+        # Experiment tracker: final test + copy artifacts + finalize
+        if self.tracker is not None:
+            try:
+                self.tracker.log_test(test_metrics, classification_report=report)
+                self.tracker.copy_best_checkpoint(self.checkpoint_dir / "best_model.pth")
+                cm_png = self.results_dir / f"confusion_matrix_test_epoch_{best_epoch}.png"
+                self.tracker.copy_confusion_matrix(cm_png)
+                self.tracker.finalize(best_epoch=best_epoch, best_val_kappa=best_kappa)
+            except Exception as e:
+                logger.warning(f"Tracker finalize failed: {e}")
+
         if self.writer is not None:
             self.writer.close()
-        
+
         return results
     
     def _plot_training_curves(self, history: Dict):
@@ -667,6 +731,29 @@ def main():
         default=1,
         help="Number of training runs",
     )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default="triple_stream",
+        help="Short name used in the experiment-tracker run directory",
+    )
+    parser.add_argument(
+        "--notes",
+        type=str,
+        default="",
+        help="Free-text notes saved to metadata/EXPERIMENTS.md",
+    )
+    parser.add_argument(
+        "--main-changes",
+        type=str,
+        default="",
+        help="One-line summary of what changed vs previous run (for EXPERIMENTS.md)",
+    )
+    parser.add_argument(
+        "--no-track",
+        action="store_true",
+        help="Disable the experiment tracker (debug only)",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -693,8 +780,27 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
         
+        # Build experiment tracker (one per run)
+        tracker = None
+        if not args.no_track:
+            run_name = args.run_name
+            if args.runs > 1:
+                run_name = f"{args.run_name}_run{run}"
+            tracker = ExperimentTracker(
+                config=config,
+                run_name=run_name,
+                notes=args.notes,
+                extra_metadata={
+                    "config_path": args.config,
+                    "main_changes": args.main_changes,
+                    "seed": seed,
+                },
+            ).start()
+
         # Train
-        trainer = TripleStreamTrainer(config, run_id=run if args.runs > 1 else None)
+        trainer = TripleStreamTrainer(
+            config, run_id=run if args.runs > 1 else None, tracker=tracker,
+        )
         results = trainer.train()
         all_results.append(results)
         

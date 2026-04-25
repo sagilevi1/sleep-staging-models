@@ -37,46 +37,67 @@ model:
   d_model: 256                # Model dimension
   n_heads: 8                  # Number of attention heads
   n_fusion_blocks: 3          # Number of fusion stages
-  dropout: 0.2                # Dropout rate
+  dropout: 0.4                # Dropout rate (raised from 0.2 to fight overfitting)
   ibi_n_features: 5           # Number of IBI/HRV features
 
 # Training configuration
 training:
   batch_size: 32
-  num_epochs: 50               # Set to 50 for full training
+  num_epochs: 50              # Set to 50 for full training
   patience: 15                # Early stopping patience
-  
+
   # Learning rates
   learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
-  
-  # Staged training (optional - for fine-tuning with pretrained PPG)
-  staged_training: false      # Set to true to enable staged training
-  
+  weight_decay: 1.0e-4        # Raised from 1e-5 to fight overfitting
+
+  # ── Loss function ────────────────────────────────────────────────────────
+  # Switch between Focal and weighted CE without changing code.
+  loss: "focal"               # "focal" or "ce"
+  focal_gamma: 2.0            # Focal Loss focusing parameter (only used if loss=focal)
+  label_smoothing: 0.0        # 0.0 to disable; 0.05–0.1 is a reasonable range
+
+  # ── ReduceLROnPlateau scheduler ──────────────────────────────────────────
+  scheduler_factor: 0.5       # multiply LR by this on plateau
+  scheduler_patience: 3       # epochs of no kappa improvement before LR cut
+
+  # ── Augmentations (numpy dataset only) ───────────────────────────────────
+  # All sigmas are applied AFTER per-window z-scoring (so they are in std units).
+  augmentation:
+    enabled: true             # master switch
+    bvp_noise_std: 0.05       # Gaussian noise on BVP
+    acc_noise_std: 0.05       # Gaussian noise on ACC channels
+    ibi_noise_std: 0.0        # IBI is small (5 features) — leave at 0 by default
+    time_shift_max_frac: 0.10 # Circular roll up to ±10% of window length
+    amplitude_jitter: 0.10    # Per-channel multiplicative gain in [1-x, 1+x]
+    modality_dropout_prob: 0.10  # P(zero one of {bvp, acc, ibi}) per window
+    drop_bvp: true
+    drop_acc: true
+    drop_ibi: true
+
+  # Backward-compat alias (kept for old configs; superseded by augmentation.modality_dropout_prob)
+  modality_dropout_prob: 0.0
+
+  # ── Staged training (optional - for fine-tuning with pretrained PPG) ─────
+  staged_training: false
   stage1:
     epochs: 10
-    ppg_encoder_lr: 0         # Frozen
+    ppg_encoder_lr: 0
     acc_encoder_lr: 1.0e-4
     ibi_encoder_lr: 1.0e-4
     fusion_lr: 1.0e-4
     temporal_lr: 1.0e-4
     classifier_lr: 1.0e-4
-  
   stage2:
     epochs: 15
-    ppg_encoder_lr: 1.0e-5    # Unfreeze with low LR
+    ppg_encoder_lr: 1.0e-5
     acc_encoder_lr: 5.0e-5
     ibi_encoder_lr: 5.0e-5
     fusion_lr: 5.0e-5
     temporal_lr: 5.0e-5
     classifier_lr: 5.0e-5
-  
   stage3:
     epochs: 25
     global_lr: 1.0e-5
-
-  # Modality dropout (regularization)
-  modality_dropout_prob: 0.0  # Set > 0 to enable (e.g., 0.1)
 
 # Output configuration
 output:
@@ -89,4 +110,3 @@ hardware:
   use_amp: true               # Mixed precision training
   gradient_accumulation_steps: 1
   device: "cuda"              # cuda or cpu
-

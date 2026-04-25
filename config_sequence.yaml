@@ -1,0 +1,76 @@
+# =============================================================================
+# DREAMT Sequence Sleep Staging Configuration
+# =============================================================================
+# Wraps the triple-stream encoder with a BiLSTM (or Transformer) over a
+# sequence of L consecutive 30-second windows from the SAME subject.
+# Loss is computed across all L positions per sample.
+# =============================================================================
+
+data:
+  preprocessed_dir: "./dreamt_processed"
+  data_dir: ""
+  fs: 64.0
+  window_sec: 30.0
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+  num_workers: 0
+
+# ── Sequence settings ────────────────────────────────────────────────────────
+sequence:
+  enabled: true
+  length: 20             # number of consecutive 30s windows per sequence
+  stride: 5              # step between sequence starts
+  model: "bilstm"        # "bilstm" or "transformer"
+  hidden_size: 256
+  num_layers: 1
+  bidirectional: true
+  dropout: 0.4
+
+# ── Encoder (per-window) settings (must match triple-stream sizes) ───────────
+model:
+  n_classes: 6
+  d_model: 256
+  n_heads: 8
+  n_fusion_blocks: 3
+  dropout: 0.4
+  ibi_n_features: 5
+
+training:
+  # Smaller batch size because each sample is L windows (memory ~ L× per sample)
+  batch_size: 4
+  num_epochs: 50
+  patience: 15
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+
+  loss: "focal"
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+
+  scheduler_factor: 0.5
+  scheduler_patience: 3
+
+  augmentation:
+    enabled: true
+    bvp_noise_std: 0.05
+    acc_noise_std: 0.05
+    ibi_noise_std: 0.0
+    time_shift_max_frac: 0.10
+    amplitude_jitter: 0.10
+    modality_dropout_prob: 0.10
+    drop_bvp: true
+    drop_acc: true
+    drop_ibi: true
+  modality_dropout_prob: 0.0   # legacy alias
+
+output:
+  save_dir: "/content/drive/MyDrive/DREAMT/outputs/sequence_stream"
+  save_frequency: 1
+  log_frequency: 10
+
+hardware:
+  use_amp: true
+  gradient_accumulation_steps: 1
+  device: "cuda"
