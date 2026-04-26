@@ -53,6 +53,10 @@ from sequence_model import create_sequence_model
 from augmentations import AugmentationConfig
 from losses import build_loss
 from experiment_tracker import ExperimentTracker
+from debug_utils import (
+    DebugConfig, log_input_stats, check_tensor, loss_is_finite,
+    grad_stats, FirstNaNHook, IntermediateCapture,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +96,14 @@ class SequenceTrainer:
         self.use_amp = config.get("hardware", {}).get("use_amp", True) and self.device.type == "cuda"
         self.scaler = GradScaler() if self.use_amp else None
         self.grad_accum_steps = config.get("hardware", {}).get("gradient_accumulation_steps", 1)
+
+        # ── Debug instrumentation (gated; zero overhead when disabled) ──────
+        self.debug = DebugConfig.from_config(config.get("training", {}))
+        self._nan_hook: Optional[FirstNaNHook] = None
+        self._capture: Optional[IntermediateCapture] = None
+        self._input_stats_logged = False
+        if self.debug.enabled:
+            logger.info(f"[DEBUG] Debug mode ENABLED: {self.debug}")
 
     def _setup_directories(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -189,11 +201,26 @@ class SequenceTrainer:
         pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
         optimizer.zero_grad()
 
+        skipped_loss = 0   # batches skipped due to non-finite loss
+        skipped_grad = 0   # batches skipped due to NaN/Inf gradients
+
         for batch_idx, (bvp, acc, ibi, labels, _, _) in enumerate(pbar):
             bvp = bvp.to(self.device, non_blocking=True)
             acc = acc.to(self.device, non_blocking=True)
             ibi = ibi.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
+
+            # ── DEBUG: one-shot input stats (first batch of training only) ──
+            if self.debug.enabled and not self._input_stats_logged:
+                log_input_stats(epoch, bvp, acc, ibi, labels)
+                self._input_stats_logged = True
+
+            # ── DEBUG: arm hooks for this batch ─────────────────────────────
+            if self.debug.enabled:
+                if self._nan_hook is not None:
+                    self._nan_hook.reset(epoch, batch_idx)
+                if self._capture is not None:
+                    self._capture.clear()
 
             B, L = labels.shape
 
@@ -204,24 +231,67 @@ class SequenceTrainer:
                         logits.reshape(B * L, -1),
                         labels.reshape(B * L),
                     ) / self.grad_accum_steps
-                self.scaler.scale(loss).backward()
-                if (batch_idx + 1) % self.grad_accum_steps == 0:
-                    self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-                    optimizer.zero_grad()
             else:
                 logits = model(bvp, acc, ibi)
                 loss = criterion(
                     logits.reshape(B * L, -1),
                     labels.reshape(B * L),
                 ) / self.grad_accum_steps
+
+            # ── DEBUG: forward checks (encoder / BiLSTM / logits) ───────────
+            if self.debug.enabled:
+                if self._capture is not None:
+                    check_tensor(
+                        "encoder_out", self._capture["encoder"],
+                        epoch, batch_idx, self.debug,
+                    )
+                    check_tensor(
+                        "bilstm_out", self._capture["bilstm"],
+                        epoch, batch_idx, self.debug,
+                    )
+                check_tensor("logits", logits, epoch, batch_idx, self.debug)
+
+            # ── DEBUG: loss finite check (always runs — failure is real) ────
+            if not loss_is_finite(loss, epoch, batch_idx, self.debug):
+                skipped_loss += 1
+                optimizer.zero_grad(set_to_none=True)
+                # Keep AMP scaler in sync even on skip:
+                if self.use_amp:
+                    # No backward happened → no scaled grads → no .update() needed.
+                    # But we cleared grads above to be safe.
+                    pass
+                continue
+
+            # ── Backward ────────────────────────────────────────────────────
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                if (batch_idx + 1) % self.grad_accum_steps == 0:
+                    self.scaler.unscale_(optimizer)
+                    # DEBUG: gradient stats AFTER unscale_ (so norms are real)
+                    if self.debug.enabled:
+                        gs = grad_stats(model, epoch, batch_idx, self.debug)
+                        if gs["has_nan"]:
+                            skipped_grad += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            # update() lets the scaler decrease its scale factor
+                            self.scaler.update()
+                            continue
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+            else:
                 loss.backward()
                 if (batch_idx + 1) % self.grad_accum_steps == 0:
+                    if self.debug.enabled:
+                        gs = grad_stats(model, epoch, batch_idx, self.debug)
+                        if gs["has_nan"]:
+                            skipped_grad += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
                 preds = logits.argmax(dim=-1)
@@ -230,7 +300,16 @@ class SequenceTrainer:
                 total += B * L
 
             if batch_idx % log_freq == 0:
-                pbar.set_postfix({"loss": running_loss / max(total, 1), "acc": correct / max(total, 1)})
+                pbar.set_postfix({
+                    "loss": running_loss / max(total, 1),
+                    "acc": correct / max(total, 1),
+                })
+
+        if self.debug.enabled and (skipped_loss or skipped_grad):
+            logger.warning(
+                f"[DEBUG epoch={epoch}] Skipped batches summary: "
+                f"loss-NaN={skipped_loss}  grad-NaN={skipped_grad}"
+            )
 
         return running_loss / max(total, 1), correct / max(total, 1)
 
@@ -341,6 +420,18 @@ class SequenceTrainer:
                 self.tracker.log_model(model)
             except Exception as e:
                 logger.warning(f"Tracker.log_model failed: {e}")
+
+        # Attach debug hooks once (only if debug_mode=true)
+        if self.debug.enabled:
+            self._nan_hook = FirstNaNHook(model).attach()
+            self._capture = IntermediateCapture()
+            # Watch the two boundaries we want to inspect separately
+            self._capture.watch("encoder", model.embedder)
+            self._capture.watch("bilstm", model.seq_head)
+            logger.info(
+                "[DEBUG] Hooks attached: FirstNaNHook on all leaf modules, "
+                "IntermediateCapture on {embedder, seq_head}"
+            )
 
         tcfg = self.config.get("training", {})
         criterion = build_loss(

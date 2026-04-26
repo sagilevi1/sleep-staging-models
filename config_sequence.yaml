@@ -52,6 +52,18 @@ training:
   scheduler_factor: 0.5
   scheduler_patience: 3
 
+  # ── Debug instrumentation (zero overhead when off) ───────────────────────
+  # When enabled:
+  #   - logs one-shot input stats (BVP/ACC/IBI min/max/mean/std + NaN/Inf)
+  #   - forward-hooks every leaf module and logs the FIRST NaN/Inf source
+  #   - checks encoder output, BiLSTM output, final logits each batch
+  #   - skips batches with non-finite loss
+  #   - skips optimizer.step() when gradients are NaN/Inf
+  #   - logs only on anomaly (NaN, Inf, |x| > threshold, large grad norm)
+  debug_mode: false
+  debug_extreme_threshold: 1.0e4   # warn if |tensor| exceeds this
+  debug_grad_norm_warn: 1.0e3      # warn if grad norm exceeds this
+
   augmentation:
     enabled: true
     bvp_noise_std: 0.05
