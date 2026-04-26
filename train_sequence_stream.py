@@ -55,7 +55,7 @@ from losses import build_loss
 from experiment_tracker import ExperimentTracker
 from debug_utils import (
     DebugConfig, log_input_stats, check_tensor, loss_is_finite,
-    grad_stats, FirstNaNHook, IntermediateCapture,
+    grad_stats, FirstNaNHook, IntermediateCapture, dump_failing_batch,
 )
 
 logging.basicConfig(
@@ -239,28 +239,45 @@ class SequenceTrainer:
                 ) / self.grad_accum_steps
 
             # ── DEBUG: forward checks (encoder / BiLSTM / logits) ───────────
+            forward_ok = True
             if self.debug.enabled:
                 if self._capture is not None:
-                    check_tensor(
+                    forward_ok &= check_tensor(
                         "encoder_out", self._capture["encoder"],
                         epoch, batch_idx, self.debug,
                     )
-                    check_tensor(
+                    forward_ok &= check_tensor(
                         "bilstm_out", self._capture["bilstm"],
                         epoch, batch_idx, self.debug,
                     )
-                check_tensor("logits", logits, epoch, batch_idx, self.debug)
+                forward_ok &= check_tensor(
+                    "logits", logits, epoch, batch_idx, self.debug
+                )
 
-            # ── DEBUG: loss finite check (always runs — failure is real) ────
-            if not loss_is_finite(loss, epoch, batch_idx, self.debug):
-                skipped_loss += 1
-                optimizer.zero_grad(set_to_none=True)
-                # Keep AMP scaler in sync even on skip:
-                if self.use_amp:
-                    # No backward happened → no scaled grads → no .update() needed.
-                    # But we cleared grads above to be safe.
-                    pass
-                continue
+            loss_finite = loss_is_finite(loss, epoch, batch_idx, self.debug)
+
+            # ── DEBUG: forensic dump on any forward/loss anomaly ────────────
+            if (self.debug.enabled and not forward_ok) or not loss_finite:
+                reason = (
+                    "loss_non_finite" if not loss_finite
+                    else "forward_anomaly"
+                )
+                try:
+                    dump_failing_batch(
+                        epoch=epoch, batch_idx=batch_idx, reason=reason,
+                        bvp=bvp, acc=acc, ibi=ibi, labels=labels,
+                        logits=logits, loss=loss,
+                        capture=self._capture, criterion=criterion,
+                        num_classes=int(self.config.get("model", {}).get(
+                            "n_classes", NUM_CLASSES)),
+                        model=model,
+                    )
+                except Exception as e:
+                    logger.error(f"[DUMP] dump_failing_batch crashed: {e}")
+                if not loss_finite:
+                    skipped_loss += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
             # ── Backward ────────────────────────────────────────────────────
             if self.use_amp:
@@ -271,6 +288,23 @@ class SequenceTrainer:
                     if self.debug.enabled:
                         gs = grad_stats(model, epoch, batch_idx, self.debug)
                         if gs["has_nan"]:
+                            try:
+                                dump_failing_batch(
+                                    epoch=epoch, batch_idx=batch_idx,
+                                    reason="grad_nan_amp",
+                                    bvp=bvp, acc=acc, ibi=ibi, labels=labels,
+                                    logits=logits, loss=loss,
+                                    capture=self._capture,
+                                    criterion=criterion,
+                                    num_classes=int(self.config.get(
+                                        "model", {}).get(
+                                        "n_classes", NUM_CLASSES)),
+                                    model=model,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"[DUMP] dump_failing_batch crashed: {e}"
+                                )
                             skipped_grad += 1
                             optimizer.zero_grad(set_to_none=True)
                             # update() lets the scaler decrease its scale factor
@@ -286,6 +320,23 @@ class SequenceTrainer:
                     if self.debug.enabled:
                         gs = grad_stats(model, epoch, batch_idx, self.debug)
                         if gs["has_nan"]:
+                            try:
+                                dump_failing_batch(
+                                    epoch=epoch, batch_idx=batch_idx,
+                                    reason="grad_nan_fp32",
+                                    bvp=bvp, acc=acc, ibi=ibi, labels=labels,
+                                    logits=logits, loss=loss,
+                                    capture=self._capture,
+                                    criterion=criterion,
+                                    num_classes=int(self.config.get(
+                                        "model", {}).get(
+                                        "n_classes", NUM_CLASSES)),
+                                    model=model,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"[DUMP] dump_failing_batch crashed: {e}"
+                                )
                             skipped_grad += 1
                             optimizer.zero_grad(set_to_none=True)
                             continue

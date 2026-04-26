@@ -103,6 +103,68 @@ class FocalLoss(nn.Module):
             return loss_per_sample[valid].sum()
         return loss_per_sample
 
+    @torch.no_grad()
+    def compute_internals(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> dict:
+        """
+        Diagnostic: returns per-sample internals using the STANDARD focal
+        formulation (alpha_t * (1 - p_t)^gamma * CE), without the `0 * -inf`
+        path that the training forward can hit. Use to compare against the
+        training forward when loss goes NaN.
+
+        Returns dict with tensors (detached, on logits device):
+            ce            : (N,)  cross-entropy per sample = -log p_t
+            p_t           : (N,)  prob assigned to true class
+            focal_weight  : (N,)  (1 - p_t)^gamma
+            alpha_t       : (N,)  per-sample alpha
+            loss_per_sample: (N,) alpha_t * focal_weight * ce
+            valid         : (N,)  bool mask
+        """
+        if logits.dim() == 3:
+            B, C, T = logits.shape
+            logits_flat = logits.permute(0, 2, 1).reshape(-1, C)
+            targets_flat = targets.reshape(-1)
+        else:
+            logits_flat = logits
+            targets_flat = targets
+
+        log_probs = F.log_softmax(logits_flat, dim=-1)
+        probs = log_probs.exp()
+        N, C = log_probs.shape
+
+        valid = (targets_flat >= 0)
+        tgt = targets_flat.clamp(min=0)
+        one_hot = F.one_hot(tgt, num_classes=C).float()
+        if self.label_smoothing > 0:
+            one_hot_s = (
+                one_hot * (1.0 - self.label_smoothing)
+                + self.label_smoothing / C
+            )
+        else:
+            one_hot_s = one_hot
+
+        ce = -(one_hot_s * log_probs).sum(dim=-1)
+        p_t = (one_hot * probs).sum(dim=-1).clamp(min=0.0, max=1.0)
+        focal_weight = (1.0 - p_t).clamp(min=0.0).pow(self.gamma)
+
+        if self.alpha is not None:
+            alpha = self.alpha.to(logits_flat.device).unsqueeze(0)
+            alpha_t = (one_hot * alpha).sum(dim=-1)
+        else:
+            alpha_t = torch.ones(N, device=logits_flat.device)
+
+        loss_per_sample = alpha_t * focal_weight * ce
+        return {
+            "ce": ce.detach(),
+            "p_t": p_t.detach(),
+            "focal_weight": focal_weight.detach(),
+            "alpha_t": alpha_t.detach(),
+            "loss_per_sample": loss_per_sample.detach(),
+            "valid": valid.detach(),
+            "targets_flat": targets_flat.detach(),
+        }
+
 
 def build_loss(
     loss_type: str = "focal",

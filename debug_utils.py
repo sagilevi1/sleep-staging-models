@@ -82,6 +82,99 @@ class DebugConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Compact tensor formatting helpers (used by dump_failing_batch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def tensor_health_line(name: str, t: Optional[torch.Tensor]) -> str:
+    """Multi-line-safe single-line health summary for a tensor."""
+    if t is None:
+        return f"{name}: <None>"
+    if not torch.is_tensor(t):
+        return f"{name}: <not a tensor: {type(t).__name__}>"
+    if t.numel() == 0:
+        return f"{name}: shape={tuple(t.shape)} <empty>"
+    x = t.detach().float()
+    nan_mask = torch.isnan(x)
+    inf_mask = torch.isinf(x)
+    n_nan = int(nan_mask.sum().item())
+    n_inf = int(inf_mask.sum().item())
+    finite_mask = ~(nan_mask | inf_mask)
+    if finite_mask.any():
+        xf = x[finite_mask]
+        fmin = xf.min().item()
+        fmax = xf.max().item()
+        fmean = xf.mean().item()
+        fstd = xf.std().item() if xf.numel() > 1 else 0.0
+        amax = xf.abs().max().item()
+        return (
+            f"{name}: shape={tuple(t.shape)} "
+            f"min={fmin:+.3e} max={fmax:+.3e} mean={fmean:+.3e} "
+            f"std={fstd:.3e} |x|max={amax:.3e} NaN={n_nan} Inf={n_inf}"
+        )
+    return (
+        f"{name}: shape={tuple(t.shape)} <no finite values> "
+        f"NaN={n_nan} Inf={n_inf}"
+    )
+
+
+def tensor_summary(t: Optional[torch.Tensor]) -> str:
+    """Tight single-line summary for compact in-line use."""
+    if t is None:
+        return "<None>"
+    if not torch.is_tensor(t) or t.numel() == 0:
+        return "<empty>"
+    x = t.detach().float()
+    nan_mask = torch.isnan(x)
+    inf_mask = torch.isinf(x)
+    finite_mask = ~(nan_mask | inf_mask)
+    n_nan = int(nan_mask.sum().item())
+    n_inf = int(inf_mask.sum().item())
+    if finite_mask.any():
+        xf = x[finite_mask]
+        return (
+            f"min={xf.min().item():+.3e} max={xf.max().item():+.3e} "
+            f"mean={xf.mean().item():+.3e} NaN={n_nan} Inf={n_inf}"
+        )
+    return f"<no finite> NaN={n_nan} Inf={n_inf}"
+
+
+def label_distribution_line(
+    labels: torch.Tensor, num_classes: int
+) -> str:
+    """Returns 'shape=... unique=[...] counts=[c0,c1,...]'."""
+    try:
+        flat = labels.detach().reshape(-1)
+        uniq = torch.unique(flat).tolist()
+        counts = []
+        for c in range(num_classes):
+            counts.append(int((flat == c).sum().item()))
+        n_invalid = int((flat < 0).sum().item())
+        return (
+            f"shape={tuple(labels.shape)} unique={uniq} "
+            f"counts_per_class={counts} invalid(<0)={n_invalid}"
+        )
+    except Exception as e:
+        return f"<label dist failed: {e}>"
+
+
+def predicted_class_distribution_line(
+    logits: torch.Tensor, num_classes: int
+) -> str:
+    """argmax over logits (with nan_to_num to survive bad logits)."""
+    try:
+        x = torch.nan_to_num(
+            logits.detach(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        flat = x.reshape(-1, x.shape[-1]) if x.dim() > 1 else x
+        preds = flat.argmax(dim=-1)
+        counts = [int((preds == c).sum().item()) for c in range(num_classes)]
+        return f"pred_counts_per_class={counts}"
+    except Exception as e:
+        return f"<pred dist failed: {e}>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tensor checks
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -326,3 +419,195 @@ class IntermediateCapture:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Failing-batch forensic dump
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def first_nan_param(model: nn.Module) -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """Return (name, shape) of the first parameter with NaN/Inf grad, or None."""
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        if torch.isnan(g).any().item() or torch.isinf(g).any().item():
+            return name, tuple(g.shape)
+    return None
+
+
+def _fmt_seq(vals, fmt: str = "{:+.3e}", limit: int = 8) -> str:
+    out = [fmt.format(v) for v in vals[:limit]]
+    if len(vals) > limit:
+        out.append(f"...(+{len(vals) - limit})")
+    return "[" + ", ".join(out) + "]"
+
+
+def dump_failing_batch(
+    *,
+    epoch: int,
+    batch_idx: int,
+    reason: str,
+    bvp: Optional[torch.Tensor],
+    acc: Optional[torch.Tensor],
+    ibi: Optional[torch.Tensor],
+    labels: torch.Tensor,
+    logits: Optional[torch.Tensor],
+    loss: Optional[torch.Tensor],
+    capture: Optional["IntermediateCapture"],
+    criterion: Optional[nn.Module],
+    num_classes: int,
+    model: Optional[nn.Module] = None,
+) -> None:
+    """
+    Forensic dump for a batch that failed (loss NaN, forward anomaly, or
+    grad NaN). Each section is wrapped in try/except so a diagnostic bug
+    never crashes training. Logs answer one of:
+        bad input / encoder NaN / BiLSTM NaN / logits extreme/NaN /
+        Focal Loss numerical bug / backward gradient explosion
+    """
+    tag = f"[DUMP epoch={epoch} batch={batch_idx} reason={reason}]"
+    logger.error(f"{tag} ====== BEGIN FAILING-BATCH DUMP ======")
+
+    # ── (1) Input stats ────────────────────────────────────────────────────
+    try:
+        logger.error(f"{tag} -- inputs --")
+        logger.error(f"{tag}   {tensor_health_line('bvp', bvp)}")
+        logger.error(f"{tag}   {tensor_health_line('acc', acc)}")
+        logger.error(f"{tag}   {tensor_health_line('ibi', ibi)}")
+        logger.error(
+            f"{tag}   labels: {label_distribution_line(labels, num_classes)}"
+        )
+    except Exception as e:
+        logger.error(f"{tag}   <inputs section failed: {e}>")
+
+    # ── (2) Model stages ───────────────────────────────────────────────────
+    try:
+        logger.error(f"{tag} -- model stages --")
+        enc = capture["encoder"] if capture is not None else None
+        lst = capture["bilstm"] if capture is not None else None
+        logger.error(f"{tag}   {tensor_health_line('encoder_out', enc)}")
+        logger.error(f"{tag}   {tensor_health_line('bilstm_out',  lst)}")
+        logger.error(f"{tag}   {tensor_health_line('logits',      logits)}")
+        if logits is not None and torch.is_tensor(logits):
+            logger.error(
+                f"{tag}   "
+                f"{predicted_class_distribution_line(logits, num_classes)}"
+            )
+    except Exception as e:
+        logger.error(f"{tag}   <model-stages section failed: {e}>")
+
+    # ── (3) Loss internals (focal-loss specific) ───────────────────────────
+    try:
+        logger.error(f"{tag} -- loss --")
+        if loss is not None and torch.is_tensor(loss):
+            lv = loss.detach().float().item()
+            logger.error(f"{tag}   loss_value = {lv}")
+        if (
+            logits is not None
+            and torch.is_tensor(logits)
+            and criterion is not None
+            and hasattr(criterion, "compute_internals")
+        ):
+            C = logits.shape[-1]
+            logits_flat = logits.reshape(-1, C)
+            labels_flat = labels.reshape(-1)
+            internals = criterion.compute_internals(logits_flat, labels_flat)
+            ce = internals["ce"]
+            p_t = internals["p_t"]
+            fw = internals["focal_weight"]
+            at = internals["alpha_t"]
+            lps = internals["loss_per_sample"]
+
+            logger.error(f"{tag}   focal internals (standard formulation):")
+            logger.error(f"{tag}     ce              {tensor_summary(ce)}")
+            logger.error(f"{tag}     p_t             {tensor_summary(p_t)}")
+            logger.error(f"{tag}     focal_weight    {tensor_summary(fw)}")
+            logger.error(f"{tag}     alpha_t         {tensor_summary(at)}")
+            logger.error(f"{tag}     loss_per_sample {tensor_summary(lps)}")
+
+            def _bad_count(t: torch.Tensor) -> int:
+                return int((torch.isnan(t) | torch.isinf(t)).sum().item())
+
+            stage_bad = {
+                "logits":          _bad_count(logits_flat.float()),
+                "ce":              _bad_count(ce),
+                "p_t":             _bad_count(p_t),
+                "focal_weight":    _bad_count(fw),
+                "alpha_t":         _bad_count(at),
+                "loss_per_sample": _bad_count(lps),
+            }
+            logger.error(
+                f"{tag}     NaN/Inf count per stage: {stage_bad}"
+            )
+
+            try:
+                alpha_buf = getattr(criterion, "alpha", None)
+                if alpha_buf is not None and torch.is_tensor(alpha_buf):
+                    logger.error(
+                        f"{tag}     class_weights(alpha)="
+                        f"{_fmt_seq(alpha_buf.detach().float().tolist())}"
+                    )
+            except Exception:
+                pass
+
+            try:
+                bad_mask = ~torch.isfinite(lps)
+                n_bad = int(bad_mask.sum().item())
+                logger.error(
+                    f"{tag}     non-finite loss_per_sample count = {n_bad}"
+                )
+                if n_bad > 0:
+                    bad_idx = bad_mask.nonzero(as_tuple=False).flatten()[:8]
+                    logger.error(
+                        f"{tag}     first {len(bad_idx)} bad samples:"
+                    )
+                    logger.error(
+                        f"{tag}       labels ={labels_flat[bad_idx].tolist()}"
+                    )
+                    logger.error(
+                        f"{tag}       p_t    ={_fmt_seq(p_t[bad_idx].tolist())}"
+                    )
+                    logger.error(
+                        f"{tag}       focal_w={_fmt_seq(fw[bad_idx].tolist())}"
+                    )
+                    logger.error(
+                        f"{tag}       ce     ={_fmt_seq(ce[bad_idx].tolist())}"
+                    )
+                    logger.error(
+                        f"{tag}       alpha_t={_fmt_seq(at[bad_idx].tolist())}"
+                    )
+            except Exception as e:
+                logger.error(f"{tag}     <bad-sample slice failed: {e}>")
+
+            try:
+                fwd_loss = criterion(logits_flat, labels_flat)
+                logger.error(
+                    f"{tag}   criterion.forward() recomputed = "
+                    f"{fwd_loss.detach().float().item()}"
+                )
+            except Exception as e:
+                logger.error(f"{tag}   <recompute forward failed: {e}>")
+        else:
+            logger.error(
+                f"{tag}   <criterion has no compute_internals; "
+                "skipping focal internals>"
+            )
+    except Exception as e:
+        logger.error(f"{tag}   <loss section failed: {e}>")
+
+    # ── (4) Backward / first NaN parameter ─────────────────────────────────
+    try:
+        if model is not None:
+            first = first_nan_param(model)
+            if first is not None:
+                pname, pshape = first
+                logger.error(
+                    f"{tag} -- backward -- first NaN/Inf grad param: "
+                    f"'{pname}' shape={pshape}"
+                )
+    except Exception as e:
+        logger.error(f"{tag}   <backward section failed: {e}>")
+
+    logger.error(f"{tag} ====== END FAILING-BATCH DUMP ======")
