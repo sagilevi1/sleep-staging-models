@@ -267,7 +267,12 @@ class IBIFeatureEncoder(nn.Module):
     
     def __init__(self, n_features: int = 5, d_model: int = 256, dropout: float = 0.1):
         super().__init__()
-        
+
+        # Input-side normalization to stabilize the IBI branch. Backward NaNs
+        # have been observed in `ibi_encoder.mlp.0.{weight,bias}` when the
+        # raw features have very different scales / occasional outliers.
+        self.input_norm = nn.LayerNorm(n_features)
+
         self.mlp = nn.Sequential(
             nn.Linear(n_features, 64),
             nn.LayerNorm(64),
@@ -289,7 +294,13 @@ class IBIFeatureEncoder(nn.Module):
         Returns:
             embedding: (B, d_model, 1)
         """
-        emb = self.mlp(ibi_features)  # (B, d_model)
+        # Defensive: clip extreme values (e.g. inf-like outliers from very
+        # small windows) before the LayerNorm/MLP. nan_to_num turns NaNs into
+        # 0 so a single bad feature does not poison the whole branch.
+        x = torch.nan_to_num(ibi_features, nan=0.0, posinf=10.0, neginf=-10.0)
+        x = x.clamp(min=-10.0, max=10.0)
+        x = self.input_norm(x)
+        emb = self.mlp(x)  # (B, d_model)
         return emb.unsqueeze(-1)  # (B, d_model, 1)
 
 

@@ -83,6 +83,12 @@ output:
   log_frequency: 10
 
 hardware:
-  use_amp: true
+  use_amp: false              # disabled: AMP caused NaN grads in ibi_encoder.mlp.0
   gradient_accumulation_steps: 1
   device: "cuda"
+
+stability:
+  grad_clip_max_norm: 1.0     # gradient clipping (always applied)
+  class_weight_cap: 3.0       # cap focal-loss alpha to avoid extreme grads
+  skip_nonfinite_grads: true  # zero & skip optimizer step if grads have NaN/Inf
+  ibi_input_clip: 10.0        # defensive |x| clip on ibi features before encoder

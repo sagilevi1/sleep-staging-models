@@ -96,6 +96,21 @@ class SequenceTrainer:
         self.use_amp = config.get("hardware", {}).get("use_amp", True) and self.device.type == "cuda"
         self.scaler = GradScaler() if self.use_amp else None
         self.grad_accum_steps = config.get("hardware", {}).get("gradient_accumulation_steps", 1)
+        if self.use_amp:
+            logger.info("AMP: ENABLED (autocast + GradScaler)")
+        else:
+            logger.info("AMP: DISABLED (full fp32 forward/backward)")
+
+        # ── Stability knobs (numerical safety; always applied, even with debug off)
+        stab = config.get("stability", {}) or {}
+        self.grad_clip_max_norm = float(stab.get("grad_clip_max_norm", 1.0))
+        self.class_weight_cap = stab.get("class_weight_cap", None)
+        self.skip_nonfinite_grads = bool(stab.get("skip_nonfinite_grads", True))
+        logger.info(
+            f"Stability: grad_clip={self.grad_clip_max_norm} "
+            f"class_weight_cap={self.class_weight_cap} "
+            f"skip_nonfinite_grads={self.skip_nonfinite_grads}"
+        )
 
         # ── Debug instrumentation (gated; zero overhead when disabled) ──────
         self.debug = DebugConfig.from_config(config.get("training", {}))
@@ -150,7 +165,19 @@ class SequenceTrainer:
             )
 
         self.class_weights = train_ds.get_class_weights().to(self.device)
-        logger.info(f"Class weights: {self.class_weights.tolist()}")
+        if self.class_weight_cap is not None:
+            cap = float(self.class_weight_cap)
+            raw = self.class_weights.tolist()
+            self.class_weights = self.class_weights.clamp(max=cap)
+            logger.info(
+                f"Class weights (raw):    {[f'{w:.3f}' for w in raw]}"
+            )
+            logger.info(
+                f"Class weights (capped@{cap}): "
+                f"{[f'{w:.3f}' for w in self.class_weights.tolist()]}"
+            )
+        else:
+            logger.info(f"Class weights: {self.class_weights.tolist()}")
 
         if self.tracker is not None:
             try:
@@ -191,6 +218,17 @@ class SequenceTrainer:
         logger.info(f"Model parameters: {model.get_num_parameters():,}")
         logger.info(f"Trainable parameters: {model.get_num_trainable_parameters():,}")
         return model
+
+    # ── Always-on cheap grad-NaN/Inf detector (independent of debug_mode) ──
+    @staticmethod
+    def _grads_have_nan(model) -> bool:
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            if torch.isnan(g).any().item() or torch.isinf(g).any().item():
+                return True
+        return False
 
     # ── Training step ───────────────────────────────────────────────────────
 
@@ -284,33 +322,37 @@ class SequenceTrainer:
                 self.scaler.scale(loss).backward()
                 if (batch_idx + 1) % self.grad_accum_steps == 0:
                     self.scaler.unscale_(optimizer)
-                    # DEBUG: gradient stats AFTER unscale_ (so norms are real)
+                    # Optional detailed debug stats (logs only on anomaly)
                     if self.debug.enabled:
-                        gs = grad_stats(model, epoch, batch_idx, self.debug)
-                        if gs["has_nan"]:
+                        grad_stats(model, epoch, batch_idx, self.debug)
+                    # Always-on safety: if any grad is NaN/Inf, skip step
+                    if self.skip_nonfinite_grads and self._grads_have_nan(model):
+                        if self.debug.enabled:
                             try:
                                 dump_failing_batch(
                                     epoch=epoch, batch_idx=batch_idx,
                                     reason="grad_nan_amp",
                                     bvp=bvp, acc=acc, ibi=ibi, labels=labels,
                                     logits=logits, loss=loss,
-                                    capture=self._capture,
-                                    criterion=criterion,
+                                    capture=self._capture, criterion=criterion,
                                     num_classes=int(self.config.get(
-                                        "model", {}).get(
-                                        "n_classes", NUM_CLASSES)),
+                                        "model", {}).get("n_classes", NUM_CLASSES)),
                                     model=model,
                                 )
                             except Exception as e:
-                                logger.error(
-                                    f"[DUMP] dump_failing_batch crashed: {e}"
-                                )
-                            skipped_grad += 1
-                            optimizer.zero_grad(set_to_none=True)
-                            # update() lets the scaler decrease its scale factor
-                            self.scaler.update()
-                            continue
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                logger.error(f"[DUMP] dump_failing_batch crashed: {e}")
+                        else:
+                            logger.warning(
+                                f"[STAB epoch={epoch} batch={batch_idx}] "
+                                "NaN/Inf gradients (AMP) — zeroing & skipping step"
+                            )
+                        skipped_grad += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                        continue
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=self.grad_clip_max_norm
+                    )
                     self.scaler.step(optimizer)
                     self.scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -318,29 +360,33 @@ class SequenceTrainer:
                 loss.backward()
                 if (batch_idx + 1) % self.grad_accum_steps == 0:
                     if self.debug.enabled:
-                        gs = grad_stats(model, epoch, batch_idx, self.debug)
-                        if gs["has_nan"]:
+                        grad_stats(model, epoch, batch_idx, self.debug)
+                    if self.skip_nonfinite_grads and self._grads_have_nan(model):
+                        if self.debug.enabled:
                             try:
                                 dump_failing_batch(
                                     epoch=epoch, batch_idx=batch_idx,
                                     reason="grad_nan_fp32",
                                     bvp=bvp, acc=acc, ibi=ibi, labels=labels,
                                     logits=logits, loss=loss,
-                                    capture=self._capture,
-                                    criterion=criterion,
+                                    capture=self._capture, criterion=criterion,
                                     num_classes=int(self.config.get(
-                                        "model", {}).get(
-                                        "n_classes", NUM_CLASSES)),
+                                        "model", {}).get("n_classes", NUM_CLASSES)),
                                     model=model,
                                 )
                             except Exception as e:
-                                logger.error(
-                                    f"[DUMP] dump_failing_batch crashed: {e}"
-                                )
-                            skipped_grad += 1
-                            optimizer.zero_grad(set_to_none=True)
-                            continue
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                logger.error(f"[DUMP] dump_failing_batch crashed: {e}")
+                        else:
+                            logger.warning(
+                                f"[STAB epoch={epoch} batch={batch_idx}] "
+                                "NaN/Inf gradients (fp32) — zeroing & skipping step"
+                            )
+                        skipped_grad += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=self.grad_clip_max_norm
+                    )
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
