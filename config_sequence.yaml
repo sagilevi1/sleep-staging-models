@@ -60,7 +60,7 @@ training:
   #   - skips batches with non-finite loss
   #   - skips optimizer.step() when gradients are NaN/Inf
   #   - logs only on anomaly (NaN, Inf, |x| > threshold, large grad norm)
-  debug_mode: false
+  debug_mode: true
   debug_extreme_threshold: 1.0e4   # warn if |tensor| exceeds this
   debug_grad_norm_warn: 1.0e3      # warn if grad norm exceeds this
 
